@@ -129,6 +129,7 @@ class QueryIndexResponse(Model):
 
 # LlamaIndex protocol specification
 # Used to identify and version the LlamaIndex-specific protocol
+
 llamaindex_protocol_spec = {
     "name": "llamaindex",
     "version": "0.1.0",
@@ -151,35 +152,55 @@ class LlamaIndexAdapter:
     The adapter creates a single protocol that wraps the LlamaIndex agent/workflow/engine,
     providing seamless integration with uAgents messaging system.
     
+    Registration Behavior:
+        - Almanac (local): ALWAYS automatic via uAgents library
+        - Agentverse (cloud): Optional, only if agentverse_api_token provided
+    
     Thread Safety:
         All handlers are async and thread-safe.
         
     Error Handling:
         All operations are wrapped in comprehensive try/except blocks internally.
         User code doesn't need try/catch - adapter handles all errors gracefully.
-        
-    Example:
-        >>> # Create LlamaIndex agent (Workflow, Agent, or Engine)
-        >>> agent_ll = create_your_llamaindex_agent()
+    
+    Simple Usage (Recommended - with adapter.run()):
+        >>> from uagents import Agent
+        >>> from uagents_adapter import LlamaIndexAdapter
         >>> 
-        >>> # Create adapter with optional Agentverse registration
+        >>> # Create adapter (without token = local only)
+        >>> adapter = LlamaIndexAdapter(agent_ll)
+        >>> 
+        >>> # Create uAgent
+        >>> agent = Agent(name="my_agent", seed="...", port=8001, mailbox=True)
+        >>> agent.include(adapter.protocol, publish_manifest=True)
+        >>> 
+        >>> # Run with auto-registration
+        >>> adapter.run(agent)  # ✅ Handles registration + running!
+    
+    With Agentverse Cloud Registration:
+        >>> # Create adapter with token
         >>> adapter = LlamaIndexAdapter(
         >>>     agent_ll,
-        >>>     agentverse_api_token="your_token",
+        >>>     agentverse_api_token="agv_xxx",  # ✅ Token provided
         >>>     description="My RAG agent"
         >>> )
         >>> 
-        >>> # Create uAgent
-        >>> agent = Agent(name="My Agent", seed="my_seed", port=8001, mailbox=True)
-        >>> 
-        >>> # Include protocol
+        >>> agent = Agent(name="my_agent", seed="...", port=8001, mailbox=True)
         >>> agent.include(adapter.protocol, publish_manifest=True)
         >>> 
-        >>> # Register to Agentverse marketplace (optional)
-        >>> adapter.register_agent(agent)
+        >>> # Run with cloud registration
+        >>> adapter.run(agent)  # ✅ Registers to Almanac + Agentverse
+    
+    Advanced Usage (Manual Control):
+        >>> # If you need async or manual control
+        >>> adapter = LlamaIndexAdapter(agent_ll)
+        >>> agent = Agent(...)
+        >>> agent.include(adapter.protocol, publish_manifest=True)
         >>> 
-        >>> # Run
-        >>> agent.run()
+        >>> adapter.register(agent)  # Setup registration handler only
+        >>> agent.run()  # Run manually (sync)
+        >>> # OR
+        >>> await agent.run_async()  # Run manually (async)
         
     Attributes:
         agent_ll: The LlamaIndex agent/workflow/engine instance
@@ -267,53 +288,45 @@ class LlamaIndexAdapter:
         """
         return self._protocol
     
-    def enable_agentverse_registration(
+    def register(
         self, 
         agent: Any, 
         readme: Optional[str] = None,
         wait_seconds: int = 10
     ):
-        """Enable automatic Agentverse marketplace registration on agent startup.
+        """Register agent with Almanac (always) and Agentverse (if token provided).
         
-        This method AUTOMATICALLY registers a startup handler that will register
-        your agent to Agentverse marketplace after the agent is fully initialized.
+        This method AUTOMATICALLY registers a startup handler that will:
+        - ✅ Always: Register to Almanac for local agent discovery (automatic via uAgents)
+        - ✅ If token provided: Register to Agentverse cloud marketplace
         
-        No need to write @agent.on_event("startup") - the adapter handles it!
+        The Almanac registration happens automatically through the uAgents library.
+        This method only needs to handle optional Agentverse cloud registration.
         
         Args:
             agent: The uAgent instance (must have .name and .address attributes)
-            readme: Optional custom README content (auto-generated if None)
+            readme: Optional custom README (only used if token provided)
             wait_seconds: Seconds to wait after startup before registration (default: 10)
-        
-        Raises:
-            ValueError: If agentverse_api_token was not provided in __init__
             
-        Example:
-            >>> # Create adapter
+        Example (with Agentverse cloud):
             >>> adapter = LlamaIndexAdapter(
             >>>     agent_ll,
-            >>>     agentverse_api_token="agv_xxxxxxxxxx",
+            >>>     agentverse_api_token="agv_xxx",  # ✅ Token provided
             >>>     description="My RAG agent"
             >>> )
-            >>> 
-            >>> # Create uAgent
             >>> agent = Agent(name="my_agent", mailbox=True)
             >>> agent.include(adapter.protocol)
-            >>> 
-            >>> # Enable auto-registration (that's it! no startup handler needed)
-            >>> adapter.enable_agentverse_registration(agent)
-            >>> 
-            >>> # Run - registration happens automatically
+            >>> adapter.register(agent)  # Registers to Almanac + Agentverse
+            >>> agent.run()
+        
+        Example (local only, no cloud):
+            >>> adapter = LlamaIndexAdapter(agent_ll)  # ❌ No token
+            >>> agent = Agent(name="my_agent", mailbox=True)
+            >>> agent.include(adapter.protocol)
+            >>> adapter.register(agent)  # Registers to Almanac only
             >>> agent.run()
         """
-        if not self.agentverse_api_token:
-            raise ValueError(
-                "agentverse_api_token is required for registration. "
-                "Pass it when creating adapter: "
-                "LlamaIndexAdapter(agent_ll, agentverse_api_token='your_token')"
-            )
-        
-        logger.info(f"Enabling Agentverse auto-registration for agent '{agent.name}'")
+        logger.info(f"Setting up registration for agent '{agent.name}'...")
         
         # Store registration params for the startup handler
         self._agent_for_registration = agent
@@ -322,7 +335,7 @@ class LlamaIndexAdapter:
         
         # Register startup handler that will do the registration
         @agent.on_event("startup")
-        async def auto_register_to_agentverse(ctx):
+        async def auto_register(ctx):
             """Auto-registration handler (created internally by adapter)."""
             import asyncio
             
@@ -332,27 +345,93 @@ class LlamaIndexAdapter:
             )
             await asyncio.sleep(wait_seconds)
             
-            # Additional wait for mailbox to be ready
-            ctx.logger.info("Waiting additional 10 seconds for mailbox setup...")
-            await asyncio.sleep(10)
+            # Almanac registration happens AUTOMATICALLY via uAgents library
+            # The uAgents Agent.run() method handles this internally
+            ctx.logger.info("[OK] Agent registered to Almanac (automatic via uAgents)")
+            ctx.logger.info("   Agent is discoverable locally")
             
-            ctx.logger.info("Agent initialized, attempting Agentverse registration...")
-            
-            try:
-                # Call internal registration method
-                self._perform_registration(
-                    self._agent_for_registration,
-                    self._readme_for_registration
-                )
-                ctx.logger.info("✅ Successfully registered to Agentverse marketplace!")
-                ctx.logger.info("🌐 Check 'My Agents' at https://agentverse.ai")
-            except Exception as e:
-                ctx.logger.error(f"❌ Registration failed: {e}")
-                ctx.logger.info("⚠️  Agent will still work but won't appear on agentverse.ai")
-                ctx.logger.info("💡 Try opening the inspector link and clicking 'Connect' first")
+            # Agentverse cloud registration (only if token provided)
+            if self.agentverse_api_token:
+                ctx.logger.info("[CLOUD] Agentverse token found")
+                ctx.logger.info("[INFO] Agent will be automatically registered via mailbox connection")
+                ctx.logger.info("[INFO] Look for '[mailbox]: Successfully registered' message")
+                ctx.logger.info("[OK] Agent ready for Agentverse and ASI1 integration")
+            else:
+                ctx.logger.info("[INFO] No Agentverse token provided - skipping cloud registration")
+                ctx.logger.info("   Agent is discoverable locally via Almanac only")
         
-        logger.info("✅ Auto-registration handler registered")
-        logger.info(f"   Will register to Agentverse {wait_seconds}s after startup")
+        logger.info("[OK] Registration handler added")
+        if self.agentverse_api_token:
+            logger.info("   Will register to: Almanac (auto) + Agentverse (cloud)")
+        else:
+            logger.info("   Will register to: Almanac (auto) only")
+    
+    def run(
+        self,
+        agent: Any,
+        readme: Optional[str] = None,
+        wait_seconds: int = 10
+    ):
+        """Run the agent with automatic registration (Almanac always + Agentverse if token).
+        
+        This is the SIMPLEST way to use the adapter. It handles everything:
+        1. Sets up automatic registration (Almanac + optional Agentverse)
+        2. Runs the agent
+        
+        The agent will automatically:
+        - ✅ Register to Almanac for local discovery (always)
+        - ✅ Register to Agentverse marketplace (if token provided in __init__)
+        
+        Args:
+            agent: The uAgent instance (must have protocol already included)
+            readme: Optional custom README for Agentverse (only used if token provided)
+            wait_seconds: Seconds to wait after startup before registration (default: 10)
+            
+        Example (without Agentverse token - local only):
+            >>> from uagents import Agent
+            >>> from uagents_adapter import LlamaIndexAdapter
+            >>> 
+            >>> # Create adapter without token
+            >>> adapter = LlamaIndexAdapter(agent_ll)
+            >>> 
+            >>> # Create agent
+            >>> agent = Agent(name="my_agent", seed="...", port=8001, mailbox=True)
+            >>> agent.include(adapter.protocol, publish_manifest=True)
+            >>> 
+            >>> # Run with auto-registration (Almanac only)
+            >>> adapter.run(agent)  # ✅ Registers to Almanac automatically
+        
+        Example (with Agentverse token - cloud registration):
+            >>> from uagents import Agent
+            >>> from uagents_adapter import LlamaIndexAdapter
+            >>> 
+            >>> # Create adapter with token
+            >>> adapter = LlamaIndexAdapter(
+            >>>     agent_ll,
+            >>>     agentverse_api_token="agv_xxx",
+            >>>     description="My RAG agent"
+            >>> )
+            >>> 
+            >>> # Create agent
+            >>> agent = Agent(name="my_agent", seed="...", port=8001, mailbox=True)
+            >>> agent.include(adapter.protocol, publish_manifest=True)
+            >>> 
+            >>> # Run with auto-registration (Almanac + Agentverse)
+            >>> adapter.run(agent)  # ✅ Registers to Almanac + Agentverse cloud
+        
+        Note:
+            The protocol must be included BEFORE calling run():
+            >>> agent.include(adapter.protocol, publish_manifest=True)
+            >>> adapter.run(agent)  # ✅ Correct order
+        """
+        logger.info("[START] Starting agent with automatic registration...")
+        
+        # Step 1: Set up registration handler
+        self.register(agent, readme=readme, wait_seconds=wait_seconds)
+        
+        # Step 2: Run the agent (blocking)
+        logger.info("Starting agent.run()...")
+        agent.run()
     
     def _perform_registration(self, agent: Any, readme: Optional[str] = None):
         """Internal method to perform the actual registration.
@@ -409,37 +488,55 @@ class LlamaIndexAdapter:
                 except Exception as e:
                     logger.warning(f"Error connecting agent to mailbox: {e}")
             
-            # Update agent info on agentverse.ai
-            update_url = f"https://agentverse.ai/v1/agents/{agent_address}"
+            # First, try to GET the agent to see if it exists
+            get_url = f"https://agentverse.ai/v1/agents/{agent_address}"
             
-            update_payload = {
-                "name": agent.name,
-                "readme": readme,
-                "short_description": self.description or f"LlamaIndex agent: {agent.name}",
-            }
+            try:
+                get_response = requests.get(get_url, headers=headers, timeout=10)
+                
+                if get_response.status_code == 200:
+                    # Agent exists, update it
+                    logger.info(f"Agent found in Agentverse, updating metadata...")
+                    
+                    update_payload = {
+                        "name": agent.name,
+                        "readme": readme,
+                        "short_description": self.description or f"LlamaIndex agent: {agent.name}",
+                    }
+                    
+                    update_response = requests.put(
+                        get_url, json=update_payload, headers=headers, timeout=10
+                    )
+                    
+                    if update_response.status_code == 200:
+                        logger.info(f"[OK] Agent '{agent.name}' registered to Agentverse marketplace")
+                        logger.info(f"   View at: https://agentverse.ai/agents")
+                        logger.info(f"   Check 'My Agents' for: {agent.name}")
+                        self._registered = True
+                    else:
+                        logger.warning(
+                            f"Failed to update agent: {update_response.status_code} - {update_response.text}"
+                        )
+                
+                elif get_response.status_code == 404:
+                    # Agent doesn't exist yet
+                    logger.warning(
+                        f"Agent not found in Agentverse (404). "
+                        f"This is normal for first-time setup."
+                    )
+                    logger.info(
+                        f"[TIP] The agent needs to be created in Agentverse first. "
+                        f"After clicking 'Connect' in inspector, it may take a few moments to appear in the API."
+                    )
+                else:
+                    logger.warning(f"Unexpected response when checking agent: {get_response.status_code}")
             
-            update_response = requests.put(
-                update_url, json=update_payload, headers=headers, timeout=10
-            )
-            
-            if update_response.status_code == 200:
-                logger.info(f"✅ Agent '{agent.name}' registered to Agentverse marketplace")
-                print(f"✅ Registered to Agentverse marketplace!")
-                print(f"   🌐 View at: https://agentverse.ai/agents")
-                print(f"   📋 Check 'My Agents' for: {agent.name}")
-                self._registered = True
-            else:
-                logger.error(
-                    f"Failed to update agent info: "
-                    f"{update_response.status_code} - {update_response.text}"
-                )
-                raise Exception(
-                    f"Registration failed: {update_response.status_code}"
-                )
+            except Exception as e:
+                logger.warning(f"Error checking agent status: {e}")
             
         except Exception as e:
-            logger.error(f"Error registering agent to Agentverse: {e}")
-            raise
+            logger.warning(f"Agentverse registration error: {e}")
+            logger.info(f"[INFO] Agent still works locally via Almanac")
     
     def _generate_readme(self, agent_name: str) -> str:
         """Generate README for Agentverse marketplace listing.

@@ -21,7 +21,7 @@ def create_dummy_llamaindex_agent():
         LlamaIndex FunctionAgent powered by Google Gemini
     """
     # Get API key from environment or use default
-    api_key = os.getenv("GOOGLE_API_KEY") or "your api key"
+    api_key = os.getenv("GOOGLE_API_KEY") or "AIzaSyCQLXiuy8kKOaTlZRyADitrEBh9a5TKA_w"
     
     # Create LLM
     llm = GoogleGenAI(
