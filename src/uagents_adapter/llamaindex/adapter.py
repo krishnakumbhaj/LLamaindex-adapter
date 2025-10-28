@@ -1,7 +1,9 @@
+import asyncio
+import inspect
 import logging
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, Protocol as TypingProtocol, Union, runtime_checkable
 from uuid import uuid4
 
 from uagents import Context, Model, Protocol
@@ -76,6 +78,70 @@ class QueryEngineError(LlamaIndexError):
 
 
 # ============================================================================
+# Protocol Definition
+# ============================================================================
+
+
+@runtime_checkable
+class LlamaIndexCallable(TypingProtocol):
+    """Protocol defining the callable signature for AI functions.
+    
+    Any callable (function, method, or object with __call__) that matches
+    this signature can be used with the adapter. This makes the adapter
+    framework-agnostic and works with:
+    - LlamaIndex agents/workflows
+    - CrewAI agents
+    - LangChain/LangGraph chains
+    - AutoGen agents
+    - OpenAI SDK functions
+    - Custom functions wrapping any AI framework
+    
+    The callable receives:
+        query: The user's natural language query
+        session_id: Unique session identifier for conversation tracking
+        user_id: The sender's address/ID for user-specific context
+        
+    It must return either:
+        - A string with the response
+        - An Awaitable[str] (async function)
+        
+    Example implementations:
+        >>> # Sync function
+        >>> def my_ai_function(query: str, session_id: str, user_id: str) -> str:
+        >>>     # Your AI logic here (LlamaIndex, OpenAI, etc.)
+        >>>     return f"Response to: {query}"
+        >>> 
+        >>> # Async function
+        >>> async def my_async_ai(query: str, session_id: str, user_id: str) -> str:
+        >>>     result = await some_ai_call(query)
+        >>>     return result
+        >>> 
+        >>> # Class with __call__
+        >>> class MyAIWrapper:
+        >>>     def __call__(self, query: str, session_id: str, user_id: str) -> str:
+        >>>         return self.process(query)
+    """
+    
+    def __call__(
+        self,
+        query: str,
+        session_id: str,
+        user_id: str
+    ) -> Union[str, Awaitable[str]]:
+        """Process a query with session and user context.
+        
+        Args:
+            query: Natural language query from the user
+            session_id: Unique session identifier for conversation tracking
+            user_id: User/sender identifier for personalization
+            
+        Returns:
+            Response string or awaitable that resolves to string
+        """
+        ...
+
+
+# ============================================================================
 # Message Models
 # ============================================================================
 
@@ -143,14 +209,33 @@ llamaindex_protocol_spec = {
 
 
 class LlamaIndexAdapter:
-    """Adapter for integrating LlamaIndex agents with uAgents.
+    """Universal adapter for integrating ANY AI framework with uAgents.
     
-    This adapter follows the MCP pattern where the adapter creates protocols
-    but the user maintains full control over agent creation, configuration,
-    and lifecycle.
+    This adapter is framework-agnostic and works with:
+    - LlamaIndex (agents, workflows, query engines)
+    - OpenAI SDK
+    - LangChain / LangGraph
+    - CrewAI
+    - AutoGen
+    - Custom AI functions
     
-    The adapter creates a single protocol that wraps the LlamaIndex agent/workflow/engine,
-    providing seamless integration with uAgents messaging system.
+    Instead of accepting a specific framework object, the adapter accepts
+    a simple function with signature:
+        (query: str, session_id: str, user_id: str) -> str | Awaitable[str]
+    
+    This gives you complete control over:
+    - How queries are processed
+    - How conversation memory is managed
+    - Which AI framework(s) to use
+    - How to handle session and user context
+    
+    The adapter handles:
+    - ASI1/Agentverse chat protocol integration
+    - Automatic session ID extraction/generation
+    - User ID extraction from sender
+    - Async/sync function support
+    - Error handling and graceful degradation
+    - Optional Agentverse cloud registration
     
     Registration Behavior:
         - Almanac (local): ALWAYS automatic via uAgents library
@@ -163,37 +248,68 @@ class LlamaIndexAdapter:
         All operations are wrapped in comprehensive try/except blocks internally.
         User code doesn't need try/catch - adapter handles all errors gracefully.
     
-    Simple Usage (Recommended - with adapter.run()):
+    Example with LlamaIndex:
+        >>> from llama_index.core import VectorStoreIndex
         >>> from uagents import Agent
         >>> from uagents_adapter import LlamaIndexAdapter
         >>> 
-        >>> # Create adapter (without token = local only)
-        >>> adapter = LlamaIndexAdapter(agent_ll)
+        >>> # Create your LlamaIndex setup
+        >>> index = VectorStoreIndex.from_documents(documents)
+        >>> query_engine = index.as_query_engine()
         >>> 
-        >>> # Create uAgent
-        >>> agent = Agent(name="my_agent", seed="...", port=8001, mailbox=True)
+        >>> # Wrap in a function
+        >>> def my_rag_function(query: str, session_id: str, user_id: str) -> str:
+        >>>     response = query_engine.query(query)
+        >>>     return str(response)
+        >>> 
+        >>> # Create adapter and agent
+        >>> adapter = LlamaIndexAdapter(my_rag_function)
+        >>> agent = Agent(name="my_agent", seed="...", mailbox=True)
         >>> agent.include(adapter.protocol, publish_manifest=True)
-        >>> 
-        >>> # Run with auto-registration
-        >>> adapter.run(agent)  # ✅ Handles registration + running!
+        >>> adapter.run(agent)  # ✅ One call to run everything!
     
-    With Agentverse Cloud Registration:
-        >>> # Create adapter with token
-        >>> adapter = LlamaIndexAdapter(
-        >>>     agent_ll,
-        >>>     agentverse_api_token="agv_xxx",  # ✅ Token provided
-        >>>     description="My RAG agent"
-        >>> )
+    Example with OpenAI and memory:
+        >>> from openai import OpenAI
         >>> 
-        >>> agent = Agent(name="my_agent", seed="...", port=8001, mailbox=True)
+        >>> client = OpenAI()
+        >>> conversations = {}  # session_id -> messages
+        >>> 
+        >>> async def my_openai_chat(query: str, session_id: str, user_id: str) -> str:
+        >>>     # Get or create conversation history
+        >>>     if session_id not in conversations:
+        >>>         conversations[session_id] = []
+        >>>     
+        >>>     # Add user message
+        >>>     conversations[session_id].append({"role": "user", "content": query})
+        >>>     
+        >>>     # Call OpenAI with full history
+        >>>     response = await client.chat.completions.create(
+        >>>         model="gpt-4",
+        >>>         messages=conversations[session_id]
+        >>>     )
+        >>>     result = response.choices[0].message.content
+        >>>     
+        >>>     # Store assistant response
+        >>>     conversations[session_id].append({"role": "assistant", "content": result})
+        >>>     return result
+        >>> 
+        >>> adapter = LlamaIndexAdapter(my_openai_chat)
+        >>> agent = Agent(name="openai_agent", seed="...", mailbox=True)
         >>> agent.include(adapter.protocol, publish_manifest=True)
-        >>> 
-        >>> # Run with cloud registration
+        >>> adapter.run(agent)
+    
+    Example with Agentverse cloud registration:
+        >>> adapter = LlamaIndexAdapter(
+        >>>     my_function,
+        >>>     agentverse_api_token="agv_xxx",
+        >>>     description="My AI agent"
+        >>> )
+        >>> agent = Agent(name="my_agent", seed="...", mailbox=True)
+        >>> agent.include(adapter.protocol, publish_manifest=True)
         >>> adapter.run(agent)  # ✅ Registers to Almanac + Agentverse
     
     Advanced Usage (Manual Control):
-        >>> # If you need async or manual control
-        >>> adapter = LlamaIndexAdapter(agent_ll)
+        >>> adapter = LlamaIndexAdapter(my_function)
         >>> agent = Agent(...)
         >>> agent.include(adapter.protocol, publish_manifest=True)
         >>> 
@@ -203,7 +319,7 @@ class LlamaIndexAdapter:
         >>> await agent.run_async()  # Run manually (async)
         
     Attributes:
-        agent_ll: The LlamaIndex agent/workflow/engine instance
+        function: The user's callable function
         agentverse_api_token: Optional API token for Agentverse registration
         description: Optional description for marketplace listing
         protocol: Protocol for handling queries via chat
@@ -211,58 +327,133 @@ class LlamaIndexAdapter:
     
     def __init__(
         self,
-        agent_ll: Any,
+        function: Callable[[str, str, str], Union[str, Awaitable[str]]],
         agentverse_api_token: Optional[str] = None,
         description: Optional[str] = None,
     ):
-        """Initialize the LlamaIndex adapter.
+        """Initialize the universal AI adapter.
         
-        Creates protocol with message handlers that route queries to the
-        provided LlamaIndex agent/workflow/engine.
+        Creates protocol with message handlers that route queries to your
+        provided function. The function can wrap ANY AI framework.
         
         Args:
-            agent_ll: A LlamaIndex agent, workflow, or engine instance.
-                Can be any LlamaIndex object that can process queries.
-                Common types:
-                - Workflow instance
-                - Agent instance
-                - Query engine from index.as_query_engine()
+            function: A callable that processes queries with signature:
+                (query: str, session_id: str, user_id: str) -> str | Awaitable[str]
+                
+                Can be:
+                - A regular function (sync or async)
+                - A lambda
+                - A class instance with __call__ method
+                - Any callable matching the signature
+                
+                Your function receives:
+                - query: The user's question/request
+                - session_id: Unique ID for this conversation session
+                - user_id: The sender's address/identifier
+                
+                Your function should return the response as a string.
+                
             agentverse_api_token: Optional API token for Agentverse marketplace registration.
                 If provided, you can call register_agent() to publish agent to marketplace.
+                
             description: Optional description for Agentverse marketplace listing.
                 
         Raises:
-            TypeError: If agent_ll is None
+            TypeError: If function is None or doesn't match expected signature
             
-        Example:
-            >>> # Without Agentverse registration
-            >>> adapter = LlamaIndexAdapter(agent_ll)
+        Example with LlamaIndex:
+            >>> from llama_index.core import VectorStoreIndex
             >>> 
-            >>> # With Agentverse registration
-            >>> adapter = LlamaIndexAdapter(
-            >>>     agent_ll,
-            >>>     agentverse_api_token="agv_xxxxxxxxxx",
-            >>>     description="LlamaIndex RAG agent"
-            >>> )
-            >>> 
-            >>> # With query engine
+            >>> # Create your LlamaIndex setup
+            >>> index = VectorStoreIndex.from_documents(documents)
             >>> query_engine = index.as_query_engine()
-            >>> adapter = LlamaIndexAdapter(query_engine)
+            >>> 
+            >>> # Wrap in a function
+            >>> def my_rag_function(query: str, session_id: str, user_id: str) -> str:
+            >>>     response = query_engine.query(query)
+            >>>     return str(response)
+            >>> 
+            >>> # Create adapter
+            >>> adapter = LlamaIndexAdapter(my_rag_function)
+            
+        Example with OpenAI:
+            >>> from openai import OpenAI
+            >>> client = OpenAI()
+            >>> 
+            >>> async def my_openai_function(query: str, session_id: str, user_id: str) -> str:
+            >>>     response = await client.chat.completions.create(
+            >>>         model="gpt-4",
+            >>>         messages=[{"role": "user", "content": query}]
+            >>>     )
+            >>>     return response.choices[0].message.content
+            >>> 
+            >>> adapter = LlamaIndexAdapter(my_openai_function)
+            
+        Example with custom memory:
+            >>> conversations = {}  # session_id -> list of messages
+            >>> 
+            >>> def my_stateful_function(query: str, session_id: str, user_id: str) -> str:
+            >>>     # Get or create conversation history
+            >>>     if session_id not in conversations:
+            >>>         conversations[session_id] = []
+            >>>     
+            >>>     # Add user message
+            >>>     conversations[session_id].append({"role": "user", "content": query})
+            >>>     
+            >>>     # Call your AI with full history
+            >>>     response = your_ai_call(conversations[session_id])
+            >>>     
+            >>>     # Store response
+            >>>     conversations[session_id].append({"role": "assistant", "content": response})
+            >>>     return response
+            >>> 
+            >>> adapter = LlamaIndexAdapter(my_stateful_function)
         """
         # Validate input
-        if agent_ll is None:
+        if function is None:
             raise TypeError(
-                "agent_ll cannot be None. "
-                "Please provide a valid LlamaIndex agent, workflow, or engine."
+                "function cannot be None. "
+                "Please provide a callable with signature: "
+                "(query: str, session_id: str, user_id: str) -> str | Awaitable[str]"
             )
         
-        self.agent_ll = agent_ll
+        if not callable(function):
+            raise TypeError(
+                f"function must be callable, got {type(function).__name__}. "
+                "Please provide a function, lambda, or object with __call__ method."
+            )
+        
+        # Validate signature (check parameter count)
+        try:
+            sig = inspect.signature(function)
+            params = list(sig.parameters.values())
+            
+            # Should have exactly 3 parameters (query, session_id, user_id)
+            if len(params) != 3:
+                raise TypeError(
+                    f"function must accept exactly 3 parameters (query, session_id, user_id), "
+                    f"got {len(params)} parameters: {list(sig.parameters.keys())}"
+                )
+        except ValueError:
+            # Some built-in functions don't have inspectable signatures
+            # Allow them through
+            logger.warning(
+                "Could not inspect function signature. "
+                "Make sure your function accepts (query: str, session_id: str, user_id: str)"
+            )
+        
+        self.function = function
         self.agentverse_api_token = agentverse_api_token
         self.description = description
         self._registered = False
         
+        # Check if function is async
+        self._is_async = inspect.iscoroutinefunction(function)
+        
         logger.info(
-            f"Initializing LlamaIndexAdapter with: {type(agent_ll).__name__}"
+            f"Initializing LlamaIndexAdapter with: "
+            f"{getattr(function, '__name__', type(function).__name__)} "
+            f"({'async' if self._is_async else 'sync'})"
         )
         
         # Create protocol
@@ -587,291 +778,108 @@ Send chat messages to interact with this LlamaIndex agent. The agent will:
 Agent powered by LlamaIndex and uAgents adapter.
 """
     
-    async def _query_llamaindex(self, query_text: str) -> tuple[str, list[str] | None]:
-        """Query the LlamaIndex agent/workflow/engine.
-        
-        This method handles different LlamaIndex object types:
-        - Workflow/FunctionAgent: calls run() method (async)
-        - Agent: calls query() or chat() method  
-        - QueryEngine: calls query() method
-        
-        Args:
-            query_text: The query string
-            
-        Returns:
-            Tuple of (result_text, sources_list)
-            
-        Raises:
-            QueryEngineError: If query fails
-        """
-        try:
-            # Try different query methods based on object type
-            response = None
-            
-            # Try: workflow.run() or agent.run() (async)
-            if hasattr(self.agent_ll, 'run'):
-                try:
-                    import inspect
-                    
-                    # Check if run method is async - FunctionAgent.run is async but wrapped
-                    # So we need to check both iscoroutinefunction and if calling it returns a coroutine
-                    is_async = inspect.iscoroutinefunction(self.agent_ll.run)
-                    logger.debug(f"agent_ll.run is coroutine function: {is_async}")
-                    
-                    # Try calling with user_msg first (FunctionAgent parameter)
-                    try:
-                        response = self.agent_ll.run(user_msg=query_text)
-                        logger.debug(f"Called agent.run(user_msg=...) - Got type: {type(response).__name__}")
-                        
-                        # Check if the response is a coroutine or awaitable (async call)
-                        if inspect.iscoroutine(response) or inspect.isawaitable(response):
-                            logger.debug("Response is awaitable, awaiting it...")
-                            response = await response
-                            logger.debug(f"After await - Got type: {type(response).__name__}")
-                        
-                    except TypeError as te:
-                        # Fallback: try with query parameter for other agent types
-                        logger.debug(f"user_msg failed ({te}), trying query parameter...")
-                        response = self.agent_ll.run(query=query_text)
-                        
-                        if inspect.iscoroutine(response) or inspect.isawaitable(response):
-                            logger.debug("Response is awaitable (query param), awaiting it...")
-                            response = await response
-                            logger.debug(f"After await - Got type: {type(response).__name__}")
-                    
-                except Exception as e:
-                    logger.debug(f"run() method failed: {e}")
-                    pass
-            
-            # Try: agent.query()
-            if response is None and hasattr(self.agent_ll, 'query'):
-                try:
-                    response = self.agent_ll.query(query_text)
-                    logger.debug("Queried via agent.query()")
-                except Exception as e:
-                    logger.debug(f"query() method failed: {e}")
-                    pass
-            
-            # Try: agent.chat()
-            if response is None and hasattr(self.agent_ll, 'chat'):
-                try:
-                    response = self.agent_ll.chat(query_text)
-                    logger.debug("Queried via agent.chat()")
-                except Exception as e:
-                    logger.debug(f"chat() method failed: {e}")
-                    pass
-            
-            if response is None:
-                raise QueryEngineError(
-                    f"Could not query {type(self.agent_ll).__name__}. "
-                    f"No suitable method found (run/query/chat)."
-                )
-            
-            # Extract result text
-            result = self._extract_response_text(response)
-            
-            # Extract sources
-            sources = self._extract_sources(response)
-            
-            return result, sources if sources else None
-            
-        except Exception as e:
-            if isinstance(e, QueryEngineError):
-                raise
-            raise QueryEngineError(
-                "Failed to query LlamaIndex agent",
-                original_error=e,
-                query=query_text
-            )
-    
-    def _extract_response_text(self, response: Any) -> str:
-        """Extract text from LlamaIndex response object.
-        
-        LlamaIndex responses can have different structures depending on
-        the query engine configuration. This method handles multiple
-        response formats gracefully.
-        
-        Args:
-            response: LlamaIndex query response object
-            
-        Returns:
-            Extracted response text as string
-            
-        Raises:
-            QueryEngineError: If response text cannot be extracted
-            
-        Note:
-            This method tries multiple extraction strategies:
-            1. response.response attribute (most common, may be ChatMessage)
-            2. response.output attribute (FunctionAgent/AgentOutput)
-            3. response.text attribute (some engines)
-            4. str(response) fallback
-        """
-        try:
-            logger.debug(f"Extracting text from response type: {type(response).__name__}, module: {type(response).__module__}")
-            
-            # Try common response attribute
-            if hasattr(response, 'response'):
-                resp_obj = response.response
-                logger.debug(f"Response has .response attribute, type: {type(resp_obj).__name__}")
-                
-                # If response is a ChatMessage object, extract content
-                if hasattr(resp_obj, 'content'):
-                    result = str(resp_obj.content)
-                    logger.debug(f"Extracted via .response.content: {len(result)} chars")
-                    return result
-                else:
-                    result = str(resp_obj)
-                    logger.debug(f"Extracted via .response: {len(result)} chars")
-                    return result
-            
-            # Try output attribute (FunctionAgent returns AgentOutput with .output)
-            if hasattr(response, 'output'):
-                result = str(response.output)
-                logger.debug(f"Extracted via .output: {len(result)} chars")
-                return result
-            
-            # Try text attribute
-            if hasattr(response, 'text'):
-                result = str(response.text)
-                logger.debug(f"Extracted via .text: {len(result)} chars")
-                return result
-            
-            logger.debug("No known attributes found, trying str() conversion...")
-            # Fallback to string conversion (but catch InvalidStateError)
-            try:
-                result = str(response)
-                logger.debug(f"Extracted via str(): {len(result)} chars")
-                return result
-            except Exception as str_err:
-                # If str() fails (e.g., InvalidStateError from workflow Handler)
-                # Try one more time to get attributes
-                logger.warning(f"str() conversion failed: {type(str_err).__name__}: {str_err}")
-                if hasattr(response, '__dict__'):
-                    logger.warning(f"Response __dict__ keys: {list(response.__dict__.keys())}")
-                    # Last resort: look for any text-like attributes
-                    for attr in ['message', 'content', 'answer', 'result']:
-                        if hasattr(response, attr):
-                            result = str(getattr(response, attr))
-                            logger.debug(f"Extracted via .{attr}: {len(result)} chars")
-                            return result
-                raise str_err
-            
-        except Exception as e:
-            error_msg = "Failed to extract response text from query result"
-            logger.error(f"{error_msg}: {str(e)}")
-            raise QueryEngineError(error_msg, original_error=e)
-    
-    def _extract_sources(
+    async def _call_user_function(
         self, 
-        response: Any, 
-        max_sources: int = 3,
-        max_length: int = 200
-    ) -> list[str]:
-        """Extract source document excerpts from response.
-        
-        LlamaIndex responses can include source_nodes that reference the
-        documents used to generate the answer. This method extracts and
-        formats these sources for attribution.
-        
-        Args:
-            response: LlamaIndex query response object
-            max_sources: Maximum number of sources to extract
-            max_length: Maximum character length per source excerpt
-            
-        Returns:
-            List of source excerpts (empty list if no sources available)
-            
-        Note:
-            - Sources are truncated to max_length characters
-            - Newlines are replaced with spaces for readability
-            - Returns empty list if sources are unavailable or errors occur
-        """
-        sources = []
-        
-        try:
-            # Check for source_nodes attribute
-            if not hasattr(response, 'source_nodes'):
-                logger.debug("Response has no source_nodes attribute")
-                return sources
-            
-            source_nodes = response.source_nodes
-            
-            # Validate source_nodes
-            if not source_nodes:
-                logger.debug("source_nodes is empty")
-                return sources
-            
-            # Extract sources
-            for i, node in enumerate(source_nodes[:max_sources]):
-                try:
-                    # Extract text from node
-                    if hasattr(node, 'node') and hasattr(node.node, 'text'):
-                        text = node.node.text
-                    elif hasattr(node, 'text'):
-                        text = node.text
-                    else:
-                        logger.warning(f"Source node {i} has no text attribute")
-                        continue
-                    
-                    # Clean and truncate text
-                    text = str(text).replace('\n', ' ').strip()
-                    if len(text) > max_length:
-                        text = text[:max_length] + "..."
-                    
-                    sources.append(text)
-                    logger.debug(f"Extracted source {i+1}: {len(text)} chars")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to extract source {i}: {str(e)}")
-                    continue
-            
-            logger.debug(f"Extracted {len(sources)} source(s)")
-            return sources
-            
-        except Exception as e:
-            logger.warning(f"Error extracting sources: {str(e)}")
-            return sources
-    
-    def _format_response_with_sources(
-        self, 
-        result: str, 
-        sources: list[str]
+        query: str, 
+        session_id: str, 
+        user_id: str
     ) -> str:
-        """Format response text with source attributions.
+        """Call the user's function and handle async if needed.
         
-        Appends formatted source citations to the response text for
-        better transparency and attribution.
+        This method is framework-agnostic and simply calls whatever function
+        the user provided, passing the query, session_id, and user_id.
         
         Args:
-            result: The main response text
-            sources: List of source excerpts
+            query: The user's natural language query
+            session_id: Unique session identifier for conversation tracking
+            user_id: The sender's address/ID
             
         Returns:
-            Formatted string with result and sources
+            The response string from the user's function
             
-        Example Output:
-            "The answer is 42.
-            
-            📚 Sources:
-            1. Source document excerpt one...
-            2. Source document excerpt two..."
+        Raises:
+            Exception: If the user's function raises an error
         """
-        if not sources:
+        try:
+            logger.debug(
+                f"Calling user function: {getattr(self.function, '__name__', type(self.function).__name__)} "
+                f"({'async' if self._is_async else 'sync'})"
+            )
+            
+            # Call the user's function
+            result = self.function(query, session_id, user_id)
+            
+            # If async, await it
+            if self._is_async or inspect.iscoroutine(result) or inspect.isawaitable(result):
+                logger.debug("Function returned awaitable, awaiting...")
+                result = await result
+            
+            # Ensure result is a string
+            if not isinstance(result, str):
+                result = str(result)
+            
+            logger.debug(f"Function returned: {len(result)} chars")
             return result
+            
+        except Exception as e:
+            logger.error(f"User function error: {type(e).__name__}: {str(e)}")
+            raise
+    
+    def _generate_readme(self, agent_name: str) -> str:
+        """Generate README for Agentverse marketplace listing.
         
-        formatted = result + "\n\n📚 Sources:\n"
-        for i, source in enumerate(sources, 1):
-            formatted += f"{i}. {source}\n"
+        Args:
+            agent_name: Name of the agent
+            
+        Returns:
+            Formatted README content in Markdown
+        """
+        function_name = getattr(self.function, '__name__', type(self.function).__name__)
         
-        return formatted
+        return f"""# {agent_name}
+![tag:ai-agent](https://img.shields.io/badge/ai--agent-3D8BD3)
+<br />
+<br />
+
+An AI-powered agent with custom logic for intelligent query answering.
+
+## Description
+{self.description or f'A custom AI agent ({function_name}) integrated with uAgents for decentralized AI services.'}
+
+## How to Use
+Send chat messages to interact with this AI agent. The agent will:
+- Process your queries using custom AI logic
+- Provide intelligent responses
+- Support session-based conversations
+
+## Agent Details
+- **Framework**: Universal (works with any AI framework)
+- **Function**: `{function_name}`
+- **Protocol**: AgentChatProtocol v0.1.0
+- **Capabilities**: Query processing, session tracking, user context
+
+## Example Queries
+- "What is X?"
+- "Explain Y to me"
+- "Help me with Z"
+- "Tell me about..."
+
+## Features
+- Natural language query processing
+- Session-based conversation tracking
+- User-specific context support
+- Works with LlamaIndex, OpenAI, LangChain, CrewAI, AutoGen, and custom AI logic
+
+## Contact
+Agent powered by uAgents adapter.
+"""
     
     def _create_protocol(self) -> Protocol:
         """Create protocol for handling chat-based queries.
         
-        This protocol handles ChatMessage interactions from Agentverse UI
-        or other agents using the chat protocol. It processes text content
-        and sends responses back via chat messages.
+        This protocol handles ChatMessage interactions from ASI1/Agentverse
+        or other agents using the chat protocol. It extracts session and user
+        context and passes them to the user's function.
         
         Returns:
             Protocol configured with ChatMessage handlers
@@ -879,27 +887,29 @@ Agent powered by LlamaIndex and uAgents adapter.
         Message Flow:
             1. ChatMessage received
             2. Acknowledgement sent immediately
-            3. Text content extracted from message
-            4. Query processed via LlamaIndex agent_ll
-            5. Response formatted with sources
-            6. ChatMessage response sent back
+            3. Session ID extracted (from ctx.session or generated)
+            4. User ID extracted (from sender)
+            5. Text content extracted from message
+            6. User's function called with (query, session_id, user_id)
+            7. ChatMessage response sent back
             
         Error Handling:
-            All errors caught internally - user doesn't need try/catch.
+            All errors caught internally - graceful degradation.
         """
         protocol = Protocol(
-            name="LlamaIndexChatProtocol",
+            name="UniversalAIChatProtocol",
             version="0.1.0"
         )
         logger.debug("Creating chat protocol")
         
         @protocol.on_message(model=ChatMessage)
         async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
-            """Handle Agentverse chat messages.
+            """Handle chat messages from ASI1/Agentverse.
             
-            User doesn't need try/catch - all errors handled internally.
+            Extracts session and user context, calls user's function,
+            and sends response back.
             """
-            ctx.logger.info(f"[LlamaIndex] Received message from {sender[:8]}...")
+            ctx.logger.info(f"[AI Agent] Received message from {sender[:8]}...")
             
             # Send acknowledgement
             try:
@@ -911,17 +921,22 @@ Agent powered by LlamaIndex and uAgents adapter.
                     )
                 )
             except Exception as e:
-                ctx.logger.error(f"[LlamaIndex] Failed to send ack: {str(e)}")
+                ctx.logger.error(f"[AI Agent] Failed to send ack: {str(e)}")
+            
+            # Extract session ID (from context or generate new one)
+            session_id = ctx.session
+            # User ID is the sender address
+            user_id = sender
             
             # Process each content item
             for item in msg.content:
                 try:
                     if isinstance(item, StartSessionContent):
-                        ctx.logger.info(f"[LlamaIndex] Session started")
+                        ctx.logger.info(f"[AI Agent] Session started: {session_id}")
                         continue
                     
                     elif isinstance(item, EndSessionContent):
-                        ctx.logger.info(f"[LlamaIndex] Session ended")
+                        ctx.logger.info(f"[AI Agent] Session ended: {session_id}")
                         continue
                     
                     elif isinstance(item, TextContent):
@@ -929,32 +944,33 @@ Agent powered by LlamaIndex and uAgents adapter.
                         if not query_text or not query_text.strip():
                             continue
                         
-                        ctx.logger.info(f"[LlamaIndex] Query: {query_text[:50]}...")
+                        ctx.logger.info(f"[AI Agent] Query: {query_text[:50]}...")
                         
                         try:
-                            # Query LlamaIndex agent (async)
-                            result, sources = await self._query_llamaindex(query_text)
+                            # Call user's function with session and user context
+                            result = await self._call_user_function(
+                                query=query_text,
+                                session_id=session_id,
+                                user_id=user_id
+                            )
                             
-                            # Format with sources
-                            formatted = self._format_response_with_sources(result, sources or [])
-                            
-                            # Send response
+                            # Send response directly (no formatting)
                             await ctx.send(
                                 sender,
                                 ChatMessage(
                                     timestamp=datetime.now(timezone.utc),
                                     msg_id=uuid4(),
                                     content=[
-                                        TextContent(type="text", text=formatted)
+                                        TextContent(type="text", text=result)
                                     ]
                                 )
                             )
-                            ctx.logger.info(f"[LlamaIndex] Response sent ({len(result)} chars)")
+                            ctx.logger.info(f"[AI Agent] Response sent ({len(result)} chars)")
                             
                         except Exception as e:
                             # Send error message to user
                             error_msg = "I encountered an error processing your query. Please try again."
-                            ctx.logger.error(f"[LlamaIndex] Query error: {str(e)}\n{traceback.format_exc()}")
+                            ctx.logger.error(f"[AI Agent] Query error: {str(e)}\n{traceback.format_exc()}")
                             
                             try:
                                 await ctx.send(
@@ -969,7 +985,7 @@ Agent powered by LlamaIndex and uAgents adapter.
                                 pass
                 
                 except Exception as e:
-                    ctx.logger.error(f"[LlamaIndex] Content processing error: {str(e)}")
+                    ctx.logger.error(f"[AI Agent] Content processing error: {str(e)}")
                     continue
         
         @protocol.on_message(model=ChatAcknowledgement)
